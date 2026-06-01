@@ -1,0 +1,23 @@
+{
+  "name": "workflow-orchestrator",
+  "description": "DAG workflow orchestrator that runs steps across a pool of Kubernetes runner pods",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "NODE_TLS_REJECT_UNAUTHORIZED=0 bun --watch src/index.ts",
+    "start": "NODE_TLS_REJECT_UNAUTHORIZED=0 bun src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^1.4.0",
+    "express": "^5.2.1",
+    "ioredis": "^5.11.1"
+  }
+}
