@@ -101,11 +101,12 @@ export class Orchestrator {
     await resultQueue.consume((result) => this.handleStepResult(result))
   }
 
-  // Sequential drain: one step at a time. Parallel dispatch comes later.
+  // Dispatch is fire-and-forget, so independent steps run concurrently across
+  // the pool instead of blocking each other.
   private async drainStepQueue(): Promise<void> {
     while (true) {
       const step = await stepQueue.dequeue()
-      if (step) await this.dispatchStep(step)
+      if (step) void this.dispatchStep(step)
     }
   }
 
@@ -113,6 +114,12 @@ export class Orchestrator {
     try {
       await podManager.dispatch(step)
     } catch (err) {
+      if (err instanceof Error && err.message === "NO_POD_AVAILABLE") {
+        // The pool is fully leased; requeue and let a freed pod pick it up.
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        await stepQueue.enqueue(step)
+        return
+      }
       console.error(`Failed to dispatch step ${step.stepId}:`, err)
     }
   }
