@@ -1,20 +1,27 @@
 import type { QueuedStep, StepResult, StepStatus, Workflow, WorkflowState } from "../types/workflow"
-import { getWorkflow, setWorkflow } from "./workflow-store"
-import { getReadySteps } from "./dag"
+import { getAllWorkflows, getWorkflow, setWorkflow } from "./workflow-store"
+import { assertValidDag, getReadySteps, isTerminal, skipDependents } from "./dag"
 import { stepQueue } from "../queue/step-queue"
 import { resultQueue } from "../queue/result-queue"
 import { podManager } from "../pod-manager/pod-manager"
 
+const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS) || 10_000
+const MISSED_HEARTBEATS_BEFORE_DEAD = Number(process.env.HEARTBEAT_GRACE_BEATS) || 3
+const LIVENESS_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * MISSED_HEARTBEATS_BEFORE_DEAD
+const LIVENESS_SCAN_INTERVAL_MS = Number(process.env.LIVENESS_SCAN_INTERVAL_MS) || 5_000
+
 /**
  * The orchestrator owns workflow state. It accepts workflows, schedules the
  * steps whose dependencies are satisfied, and reacts to the lifecycle events
- * published by the pod manager.
+ * published by the pod manager (running, heartbeat, completed, failed).
  *
  * Invariant: this is the only component that writes step status. The pod
  * manager observes and reports; the orchestrator decides.
  */
 export class Orchestrator {
   async submitWorkflow(workflow: Workflow): Promise<{ workflowId: string; status: string }> {
+    assertValidDag(workflow)
+
     const state: WorkflowState = {
       workflowId: workflow.workflowId,
       status: "pending",
@@ -39,28 +46,96 @@ export class Orchestrator {
 
   async handleStepResult(result: StepResult): Promise<void> {
     const state = getWorkflow(result.workflowId)
-    if (!state) return
-
-    const stepState = state.stepState[result.stepId]
-    if (!stepState) return
-
-    stepState.status = result.status
-    stepState.podId = result.podId
-    if (result.stdout !== undefined) stepState.stdout = result.stdout
-    if (result.exitCode !== undefined) stepState.exitCode = result.exitCode
-    if (result.error !== undefined) stepState.error = result.error
-
-    if (result.status === "RUNNING" && state.status === "pending") {
-      state.status = "running"
+    if (!state) {
+      console.warn(`Ignoring result for unknown workflow ${result.workflowId}`)
+      return
     }
 
-    if (result.status === "COMPLETED") {
-      const ready = getReadySteps(state.steps, this.statusSnapshot(state))
-      await this.enqueue(state, ready)
+    const stepState = state.stepState[result.stepId]
+    if (!stepState) {
+      console.warn(`Ignoring result for unknown step ${result.stepId} in ${result.workflowId}`)
+      return
+    }
+
+    // Once a step is terminal its outcome is fixed. Late events (for example a
+    // heartbeat that races a watchdog timeout) are dropped.
+    if (isTerminal(stepState.status)) return
+
+    switch (result.status) {
+      case "RUNNING":
+        stepState.status = "RUNNING"
+        stepState.podId = result.podId
+        stepState.startedAt = result.at
+        stepState.lastHeartbeatAt = result.at
+        if (state.status === "pending") state.status = "running"
+        break
+
+      case "HEARTBEAT":
+        stepState.lastHeartbeatAt = result.at
+        break
+
+      case "COMPLETED":
+        stepState.status = "COMPLETED"
+        stepState.podId = result.podId
+        stepState.stdout = result.stdout
+        stepState.exitCode = result.exitCode
+        await this.scheduleUnblockedSteps(state)
+        break
+
+      case "FAILED":
+        stepState.status = "FAILED"
+        stepState.podId = result.podId
+        stepState.error = result.error
+        stepState.exitCode = result.exitCode
+        skipDependents(state, result.stepId)
+        break
     }
 
     this.finalizeIfDone(state)
     setWorkflow(state.workflowId, state)
+  }
+
+  /**
+   * Long-running steps emit a heartbeat on a fixed interval. If a step stops
+   * reporting — typically because its pod crashed or was evicted — no further
+   * events will ever arrive for it. This loop fails such steps so their
+   * workflow can terminate instead of hanging forever.
+   */
+  private startLivenessMonitor(): void {
+    setInterval(() => {
+      const now = Date.now()
+
+      for (const state of getAllWorkflows()) {
+        if (state.status !== "running") continue
+        let changed = false
+
+        for (const stepState of Object.values(state.stepState)) {
+          if (stepState.status !== "RUNNING") continue
+
+          const lastSeen = stepState.lastHeartbeatAt ?? stepState.startedAt ?? now
+          if (now - lastSeen <= LIVENESS_TIMEOUT_MS) continue
+
+          const silentForMs = now - lastSeen
+          console.warn(
+            `Step ${state.workflowId}/${stepState.stepId} missed heartbeats for ${silentForMs}ms; marking failed`
+          )
+          stepState.status = "FAILED"
+          stepState.error = `Pod stopped reporting after ${silentForMs}ms`
+          skipDependents(state, stepState.stepId)
+          changed = true
+        }
+
+        if (changed) {
+          this.finalizeIfDone(state)
+          setWorkflow(state.workflowId, state)
+        }
+      }
+    }, LIVENESS_SCAN_INTERVAL_MS)
+  }
+
+  private async scheduleUnblockedSteps(state: WorkflowState): Promise<void> {
+    const ready = getReadySteps(state.steps, this.statusSnapshot(state))
+    await this.enqueue(state, ready)
   }
 
   private async enqueue(state: WorkflowState, steps: { id: string; command: string }[]): Promise<void> {
@@ -79,10 +154,10 @@ export class Orchestrator {
 
   private finalizeIfDone(state: WorkflowState): void {
     const states = Object.values(state.stepState)
-    const done = states.every((step) => step.status === "COMPLETED" || step.status === "FAILED")
-    if (!done) return
+    if (!states.every((step) => isTerminal(step.status))) return
 
-    state.status = states.some((step) => step.status === "FAILED") ? "failed" : "completed"
+    const failed = states.some((step) => step.status === "FAILED" || step.status === "SKIPPED")
+    state.status = failed ? "failed" : "completed"
     console.log(`Workflow ${state.workflowId} finished: ${state.status}`)
   }
 
@@ -95,14 +170,13 @@ export class Orchestrator {
   start(): void {
     void this.consumeResults()
     void this.drainStepQueue()
+    this.startLivenessMonitor()
   }
 
   private async consumeResults(): Promise<void> {
     await resultQueue.consume((result) => this.handleStepResult(result))
   }
 
-  // Dispatch is fire-and-forget, so independent steps run concurrently across
-  // the pool instead of blocking each other.
   private async drainStepQueue(): Promise<void> {
     while (true) {
       const step = await stepQueue.dequeue()

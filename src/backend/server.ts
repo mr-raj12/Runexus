@@ -7,10 +7,15 @@ import { getWorkflow } from "./workflow-store"
 const app = express()
 app.use(express.json())
 
-// Accept a workflow for execution.
+// Accept a workflow for execution. Validation happens in the orchestrator;
+// a malformed graph (missing dependency, cycle, duplicate id) is a 400.
 app.post("/workflow", async (req, res) => {
-  const result = await orchestrator.submitWorkflow(req.body as Workflow)
-  res.status(202).json(result)
+  try {
+    const result = await orchestrator.submitWorkflow(req.body as Workflow)
+    res.status(202).json(result)
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "invalid workflow" })
+  }
 })
 
 // Current state of a workflow and each of its steps.
@@ -33,6 +38,8 @@ app.get("/workflow/:id", (req, res) => {
         exitCode: state.exitCode,
         stdout: state.stdout,
         error: state.error,
+        startedAt: state.startedAt,
+        lastHeartbeatAt: state.lastHeartbeatAt,
       }
     }),
   })
@@ -41,6 +48,10 @@ app.get("/workflow/:id", (req, res) => {
 // Pool occupancy, handy for debugging dispatch and back-pressure.
 app.get("/pods", (_req, res) => {
   res.json(podPool.getPoolStatus())
+})
+
+app.get("/healthz", (_req, res) => {
+  res.json({ status: "ok" })
 })
 
 export { app }

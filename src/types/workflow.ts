@@ -20,6 +20,8 @@ export type StepState = {
   stdout?: string
   exitCode?: number
   error?: string
+  startedAt?: number
+  lastHeartbeatAt?: number
 }
 
 export type WorkflowState = {
@@ -36,11 +38,14 @@ export type QueuedStep = {
   enqueuedAt: number
 }
 
+export type StepResultStatus = "RUNNING" | "HEARTBEAT" | "COMPLETED" | "FAILED"
+
 export type StepResult = {
   stepId: string
   workflowId: string
   podId: string
-  status: "RUNNING" | "COMPLETED" | "FAILED"
+  status: StepResultStatus
+  at: number
   stdout?: string
   exitCode?: number
   error?: string
