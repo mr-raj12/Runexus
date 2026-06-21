@@ -1,5 +1,5 @@
 {
-  "name": "workflow-orchestrator",
+  "name": "runexus",
   "description": "DAG workflow orchestrator that runs steps across a pool of Kubernetes runner pods",
   "module": "src/index.ts",
   "type": "module",
